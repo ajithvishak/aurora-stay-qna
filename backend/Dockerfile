@@ -23,6 +23,12 @@ HuggingFaceEmbeddings( \
     encode_kwargs={'normalize_embeddings': True} \
 )"
 
+# CHANGE: also download the re-ranking model at build time. The container runs in offline mode
+# (HF_HUB_OFFLINE=1 below), so every model must already be in the image cache.
+RUN python -c "\
+from sentence_transformers import CrossEncoder; \
+CrossEncoder('BAAI/bge-reranker-base', device='cpu')"
+
 # Force offline mode at runtime so it uses the cached model
 ENV TRANSFORMERS_OFFLINE=1
 ENV HF_HUB_OFFLINE=1
