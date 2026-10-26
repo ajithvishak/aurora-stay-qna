@@ -36,6 +36,28 @@ def _bm25_for(vectorstore):
     return _bm25_cache[key]
 
 
+# CHANGE: re-ranking stage added after the hybrid search. A cross-encoder reads the question and
+# each candidate chunk together and scores how well the chunk answers the question. This ranks
+# relevant chunks above chunks that are only on a related topic, which the hybrid search cannot
+# separate (it scores the question and the chunks independently).
+from sentence_transformers import CrossEncoder
+
+RERANK_MODEL = "BAAI/bge-reranker-base"
+_reranker = None   # loaded on first use
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder(RERANK_MODEL, device="cpu")
+    return _reranker
+
+
+def _content(formatted_chunk: str) -> str:
+    # Extract the chunk text from the "Content: ... Metadata: ..." format
+    return formatted_chunk.split("Content:\n", 1)[1].split("\n\nMetadata:", 1)[0]
+
+
 # Retrieve the top-k relevant chunks from the vector store
 def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
     # 1. Vector (semantic) ranking
@@ -54,13 +76,63 @@ def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
         for rank, doc in enumerate(ranking, start=1):
             score, _ = fused.get(doc.page_content, (0.0, doc))
             fused[doc.page_content] = (score + 1 / (RRF_K + rank), doc)
-    results = [doc for _, doc in sorted(fused.values(), key=lambda x: x[0], reverse=True)[:k]]
+    candidates = [doc for _, doc in sorted(fused.values(), key=lambda x: x[0], reverse=True)[:CANDIDATES]]
+
+    # 4. Re-rank the fused candidates with the cross-encoder and keep the best k
+    rerank_scores = _get_reranker().predict([(query, d.page_content) for d in candidates])
+    results = [d for _, d in sorted(zip(rerank_scores, candidates), key=lambda x: x[0], reverse=True)[:k]]
 
     # Return each chunk with its content and metadata
     return [
         f"Content:\n{r.page_content}\n\nMetadata:\n{r.metadata}"
         for r in results
     ]
+
+
+# LLM relevance filter: keep only the retrieved chunks that a complete answer would use
+#
+# CHANGE: added to raise Contextual Precision. After re-ranking, a short call to the LLM receives
+# the question and the candidate chunks and returns the numbers of the chunks that contain a fact,
+# rule, condition, fee or exception needed for the answer. Chunks that are only on a related topic
+# are dropped, so the answer (and the evaluation) only sees the evidence that is actually used.
+import json
+
+RERANK_POOL = 8   # re-ranked candidates shown to the filter
+MIN_CHUNKS = 2    # never return fewer chunks than this (the best-ranked ones are added back)
+
+FILTER_PROMPT = """You select the policy passages needed to answer a hotel staff question.
+
+Question:
+{query}
+
+Passages:
+{passages}
+
+Return the numbers of every passage that contains a fact, rule, condition, fee or exception that a complete and correct answer to this question would use.
+Leave out passages that are only on a related topic but would not be used in the answer.
+Reply with a JSON list of numbers only, for example [1, 3]. Reply [] if no passage is needed."""
+
+
+def filter_chunks(query: str, ranked_chunks: list[str], filter_model, max_chunks: int) -> list[str]:
+    passages = "\n\n".join(f"[{i}] {_content(c)}" for i, c in enumerate(ranked_chunks, start=1))
+    reply = filter_model.invoke(FILTER_PROMPT.format(query=query, passages=passages)).content
+
+    # Parse the JSON list of chunk numbers; ignore anything that is not a valid number
+    match = re.search(r"\[[\d,\s]*\]", reply)
+    picked = [n for n in (json.loads(match.group(0)) if match else []) if 1 <= n <= len(ranked_chunks)]
+    keep = [ranked_chunks[n - 1] for n in sorted(set(picked))]
+
+    # Keep at least MIN_CHUNKS chunks so the answer always has some context
+    for chunk in ranked_chunks:
+        if len(keep) >= MIN_CHUNKS:
+            break
+        if chunk not in keep:
+            keep.append(chunk)
+
+    # Return the kept chunks in re-ranker order, at most max_chunks of them
+    keep.sort(key=ranked_chunks.index)
+    return keep[:max_chunks]
+
 
 # Define the generation function that prompts the LLM with retrieved context
 #
@@ -127,7 +199,16 @@ def rag(
     )
 
     # Retrieve relevant chunks
-    retrieved_chunks = retrieve(query=query, k=k,vectorstore=vectorstore)
+    # Same two-stage selection as in the notebook: re-ranked candidates, then the LLM relevance filter
+    candidates = retrieve(query=query, k=max(k, RERANK_POOL), vectorstore=vectorstore)
+    filter_model = ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        max_tokens=50,
+        openai_api_key=os.getenv('OPENAI_API_KEY'),
+        openai_api_base=os.getenv('OPENAI_API_BASE')
+    )
+    retrieved_chunks = filter_chunks(query, candidates, filter_model, max_chunks=k)
 
     # Generate answer using retrieved chunks
     answer = generate(
